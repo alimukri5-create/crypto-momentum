@@ -65,8 +65,12 @@ BARS_PER_DAY = {"15m": 96, "30m": 48, "1h": 24, "4h": 6}
 # Data
 # --------------------------------------------------------------------------
 
+# See app.py: bump this whenever the return shape changes.
+CACHE_VERSION = 2
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
-def load(symbols, start, interval):
+def load(symbols, start, interval, cache_version=CACHE_VERSION):
     return dat.load_universe(symbols, start, interval=interval)
 
 st.title("Order-Flow Scalper")
@@ -79,7 +83,12 @@ symbols = tuple(dat.UNIVERSE[:int(n_syms)])
 
 try:
     with st.spinner(f"Fetching {len(symbols)} symbols of {interval} bars…"):
-        close, qvol, report, tbq = load(symbols, start, interval)
+        _loaded = load(symbols, start, interval)
+        if len(_loaded) < 4:
+            st.error("Stale data cache from an older version. Reboot the app "
+                     "(Manage app -> Reboot) to clear it.")
+            st.stop()
+        close, qvol, report, tbq = _loaded
 except Exception as e:
     st.error(f"Could not load data: {e}")
     st.stop()

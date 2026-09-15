@@ -88,8 +88,14 @@ cfg = eng.Config(
 # Data
 # --------------------------------------------------------------------------
 
+# Bump CACHE_VERSION whenever load()'s return shape changes. Streamlit keys
+# its cache on the arguments, not the code, so without this a redeploy serves
+# the OLD shape to NEW code and the app dies on unpack.
+CACHE_VERSION = 2
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
-def load(symbols, start):
+def load(symbols, start, cache_version=CACHE_VERSION):
     return dat.load_universe(symbols, start)
 
 st.title("Crypto Momentum")
@@ -98,7 +104,10 @@ st.caption("Long-only spot · time-series gate + cross-sectional selection · "
 
 try:
     with st.spinner("Fetching market data…"):
-        close, qvol, report, _tbq = load(tuple(universe), start)
+        _loaded = load(tuple(universe), start)
+        # Tolerant unpack: a stale cache entry with the old shape degrades
+        # gracefully instead of taking the whole page down.
+        close, qvol, report = _loaded[0], _loaded[1], _loaded[2]
 except Exception as e:
     st.error(f"Could not load market data: {e}")
     st.stop()
