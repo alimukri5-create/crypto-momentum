@@ -52,6 +52,17 @@ with st.sidebar.expander("Portfolio", expanded=True):
     max_w = st.slider("Max single weight", 0.1, 1.0, 0.35, 0.05)
     allow_cash = st.checkbox("Allow cash when few names qualify", True)
 
+with st.sidebar.expander("Your portfolio", expanded=True):
+    st.caption("Needed to turn target weights into actual orders.")
+    cash_usd = st.number_input("Spare cash (USD)", 0.0, 1e9, 10000.0, 100.0)
+    holdings_text = st.text_area(
+        "What you hold now — one per line: SYMBOL UNITS",
+        value="", height=110,
+        placeholder="SOLUSDT 12.5\nETHUSDT 1.2\nBNBUSDT 4")
+    min_trade_usd = st.number_input(
+        "Ignore orders smaller than (USD)", 0.0, 10000.0, 50.0, 10.0,
+        help="Stops you paying fees to move trivial amounts.")
+
 with st.sidebar.expander("Regime & costs", expanded=True):
     use_btc = st.checkbox("BTC regime gate", True)
     btc_ma = st.number_input("BTC regime MA (d)", 10, 200, 50)
@@ -126,19 +137,39 @@ bt, w = res["backtest"], res["weights"]
 tab_live, tab_perf, tab_risk, tab_detail = st.tabs(
     ["Today", "Performance", "Risk", "Detail"])
 
+def parse_holdings(text: str) -> pd.Series:
+    """'SOLUSDT 12.5' per line -> Series of units. Tolerant of commas/tabs."""
+    out = {}
+    for raw in text.splitlines():
+        line = raw.replace(",", " ").replace("\t", " ").strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        sym = parts[0].upper()
+        if not sym.endswith("USDT") and not sym.endswith("USD"):
+            sym = sym + "USDT"
+        try:
+            out[sym] = out.get(sym, 0.0) + float(parts[1])
+        except ValueError:
+            continue
+    return pd.Series(out, dtype=float)
+
+
 with tab_live:
     tbl = eng.current_ranking(close, qvol, cfg)
     risk_on = tbl.attrs["btc_risk_on"]
+    last_px = close.iloc[-1]
+    today = pd.Timestamp.utcnow().tz_localize(None).normalize()
+    is_rebal_today = today.dayofweek in cfg.rebalance_days
 
-    if cfg.use_btc_regime and risk_on is False:
-        st.error("**BTC REGIME: RISK OFF** — the rule says hold cash. "
-                 "No new positions.")
-    elif cfg.use_btc_regime:
-        st.success("**BTC REGIME: RISK ON** — entries permitted.")
-
+    # ---- target weights -------------------------------------------------
     picks = tbl[tbl["eligible"]].head(cfg.top_k)
-    if len(picks) == 0:
-        st.warning("No names pass the gates today.")
+    if cfg.use_btc_regime and risk_on is False:
+        wts = pd.Series(dtype=float)          # regime overrides everything
+    elif len(picks) == 0:
+        wts = pd.Series(dtype=float)
     else:
         inv = 1.0 / picks["ann_vol_%"].replace(0, np.nan)
         wts = (inv / inv.sum()).clip(upper=cfg.max_weight) if cfg.sizing == "inv_vol" \
@@ -146,19 +177,123 @@ with tab_live:
         if cfg.allow_cash:
             wts = wts * (len(picks) / cfg.top_k)
 
+    # ---- current portfolio ----------------------------------------------
+    held_units = parse_holdings(holdings_text)
+    known = [s for s in held_units.index if s in last_px.index]
+    unknown = [s for s in held_units.index if s not in last_px.index]
+    held_usd = pd.Series(
+        {s: held_units[s] * float(last_px[s]) for s in known}, dtype=float)
+    equity = float(held_usd.sum()) + float(cash_usd)
+
+    # ======================= WHAT TO DO TODAY ============================
+    st.subheader("What to do today")
+
+    if not is_rebal_today:
+        nxt = min(((d - today.dayofweek) % 7) or 7 for d in cfg.rebalance_days)
+        st.info(f"**Not a rebalance day.** Do nothing. "
+                f"Next rebalance: {(today + pd.Timedelta(days=nxt)).strftime('%A %d %b')}.")
+        st.caption("The orders below are what you would place on that day, "
+                   "based on today's data. They will change by then.")
+
+    if cfg.use_btc_regime and risk_on is False:
+        st.error("**RISK OFF — BTC is below its trend.** The rule says sell "
+                 "everything and sit in cash until it flips back.")
+    elif cfg.use_btc_regime:
+        st.success("**RISK ON — BTC is above its trend.** Positions permitted.")
+
+    if equity <= 0:
+        st.warning("Enter your holdings and spare cash in the sidebar "
+                   "(**Your portfolio**) to get actual buy and sell orders.")
+    else:
+        target_usd = (wts * equity).reindex(
+            sorted(set(wts.index) | set(held_usd.index))).fillna(0.0)
+        current_usd = held_usd.reindex(target_usd.index).fillna(0.0)
+        delta = target_usd - current_usd
+
+        rows = []
+        for sym in delta.index:
+            d = float(delta[sym])
+            cur, tgt = float(current_usd[sym]), float(target_usd[sym])
+            px = float(last_px[sym]) if sym in last_px.index else np.nan
+            if abs(d) < min_trade_usd:
+                action = "HOLD" if tgt > 0 else "—"
+                units = 0.0
+            elif d > 0:
+                action = "BUY"
+                units = d / px if px and px > 0 else np.nan
+            else:
+                action = "SELL ALL" if tgt < min_trade_usd else "SELL"
+                units = abs(d) / px if px and px > 0 else np.nan
+            if action == "—":
+                continue
+            rows.append({"action": action, "symbol": sym,
+                         "usd": round(abs(d) if action != "HOLD" else tgt, 2),
+                         "approx_units": round(units, 6) if units == units else None,
+                         "price": round(px, 4) if px == px else None,
+                         "now_usd": round(cur, 2), "target_usd": round(tgt, 2)})
+
+        orders = pd.DataFrame(rows)
+        if orders.empty:
+            st.success("**No trades needed.** Your book already matches the "
+                       "target within the minimum trade size.")
+        else:
+            order_rank = {"SELL ALL": 0, "SELL": 1, "BUY": 2, "HOLD": 3}
+            orders = orders.sort_values(
+                by="action", key=lambda c: c.map(order_rank)).reset_index(drop=True)
+
+            sells = orders[orders["action"].str.startswith("SELL")]
+            buys = orders[orders["action"] == "BUY"]
+            holds = orders[orders["action"] == "HOLD"]
+
+            if len(sells):
+                st.markdown("#### 🔴 SELL first")
+                for _, r in sells.iterrows():
+                    u = f"{r['approx_units']:g}" if r["approx_units"] else "?"
+                    st.markdown(
+                        f"- **{r['action']} {r['symbol'].replace('USDT','')}** — "
+                        f"about **{u} units** (${r['usd']:,.0f}) at ~${r['price']:,.4g}")
+            if len(buys):
+                st.markdown("#### 🟢 THEN BUY")
+                for _, r in buys.iterrows():
+                    u = f"{r['approx_units']:g}" if r["approx_units"] else "?"
+                    st.markdown(
+                        f"- **BUY {r['symbol'].replace('USDT','')}** — "
+                        f"about **{u} units** (${r['usd']:,.0f}) at ~${r['price']:,.4g}")
+            if len(holds):
+                st.markdown("#### ⚪ LEAVE ALONE")
+                st.markdown(", ".join(
+                    f"**{r['symbol'].replace('USDT','')}** (${r['target_usd']:,.0f})"
+                    for _, r in holds.iterrows()))
+
+            st.caption(
+                "Sell before you buy so the cash is there. Market orders on "
+                "spot. Units are approximate — prices move between now and "
+                "when you place them, so size by the USD figure if they differ.")
+
+            with st.expander("Order detail"):
+                st.dataframe(orders, use_container_width=True)
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Portfolio value", f"${equity:,.0f}")
+        m2.metric("Invested after", f"{float(wts.sum()):.0%}")
+        m3.metric("Cash after", f"${equity * (1 - float(wts.sum())):,.0f}")
+
+    if unknown:
+        st.warning(f"Not priced, ignored: {', '.join(unknown)}. "
+                   "Check the symbol spelling.")
+
+    # ---- reference: the target book -------------------------------------
+    if len(wts):
         st.subheader(f"Target book as of {tbl.attrs['as_of']}")
         book = pd.DataFrame({
             "weight_%": (wts * 100).round(1),
-            "score": picks["score"].round(3),
-            "30d_%": picks["ret_30d_%"].round(1),
-            "ann_vol_%": picks["ann_vol_%"].round(0),
-            "adv_$M": picks["adv_$M"].round(0),
+            "score": picks["score"].reindex(wts.index).round(3),
+            "30d_%": picks["ret_30d_%"].reindex(wts.index).round(1),
+            "ann_vol_%": picks["ann_vol_%"].reindex(wts.index).round(0),
         })
         st.dataframe(book, use_container_width=True)
-        cash = max(0.0, 1.0 - float(wts.sum()))
-        st.caption(f"Cash: {cash:.0%}"
-                   + ("  — regime gate overrides this to 100% cash"
-                      if cfg.use_btc_regime and risk_on is False else ""))
+    elif not (cfg.use_btc_regime and risk_on is False):
+        st.warning("No names pass the gates today — the rule says hold cash.")
 
     st.subheader("Full ranking")
     st.dataframe(
