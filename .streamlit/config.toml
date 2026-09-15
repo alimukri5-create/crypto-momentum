@@ -3,3 +3,7 @@ base = "dark"
 
 [server]
 headless = true
+# Streamlit Cloud hit "OSError: [Errno 24] inotify instance limit reached",
+# which killed the file watcher and stopped the app picking up new commits.
+# A deployed app has no need to watch files for changes.
+fileWatcherType = "none"
