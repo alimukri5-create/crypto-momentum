@@ -149,21 +149,35 @@ with tab_live:
     def nm(s):
         return s.replace("USDT", "").replace("USD", "")
 
-    def px(s, col="price"):
-        try:
-            v = float(tbl.loc[s, col])
-            if v >= 1000:  return f"{v:,.0f}"
-            if v >= 1:     return f"{v:,.2f}"
-            return f"{v:,.4f}"
-        except Exception:
-            return "?"
+    # Prices and exit levels are derived HERE from `close`, not read off the
+    # ranking table. The ranking table's columns depend on the engine version
+    # that happens to be deployed; `close` is always present. One less thing
+    # that can silently render "$?".
+    last_px = close.iloc[-1]
+    exit_lvl = close.rolling(cfg.ts_ma_window).mean().iloc[-1]
+    btc_exit = (float(close[dat.BENCHMARK].rolling(cfg.btc_regime_ma).mean().iloc[-1])
+                if dat.BENCHMARK in close.columns else None)
+
+    def fmt(v):
+        if v is None or v != v:
+            return "n/a"
+        v = float(v)
+        if v >= 1000:  return f"{v:,.0f}"
+        if v >= 1:     return f"{v:,.2f}"
+        return f"{v:,.4f}"
+
+    def px(s):
+        return fmt(last_px.get(s))
+
+    def ex(s):
+        return fmt(exit_lvl.get(s))
 
     is_rebal_today = today.dayofweek in cfg.rebalance_days
     day_label = today.strftime("%A %d %b")
 
     # ---------------------------------------------------------------- RISK OFF
     if cfg.use_btc_regime and risk_on is False:
-        lvl = tbl.attrs.get("btc_exit_level")
+        lvl = btc_exit
         st.markdown(f"# 🔴 Sell everything")
         st.markdown("Bitcoin is below its trend line. Close every position "
                     "at market and stay in cash.")
@@ -184,7 +198,7 @@ with tab_live:
             for s in added:
                 st.markdown(
                     f"### {nm(s)} &nbsp; — &nbsp; buy at ~\\${px(s)}\n"
-                    f"Sell it if it closes below **\\${px(s, 'exit_below')}**")
+                    f"Sell it if it closes below **\\${ex(s)}**")
 
         # ------------------------------------------------------------- HOLD
         if kept:
@@ -192,7 +206,7 @@ with tab_live:
             for s in kept:
                 st.markdown(
                     f"**{nm(s)}** — sell if it closes below "
-                    f"**\\${px(s, 'exit_below')}**  ·  now \\${px(s)}")
+                    f"**\\${ex(s)}**  ·  now \\${px(s)}")
 
         if not dropped and not added and not kept:
             st.markdown("# Nothing to hold")
@@ -200,7 +214,7 @@ with tab_live:
         elif not dropped and not added:
             st.markdown("### ✅ No trades — nothing changed since last time.")
 
-        lvl = tbl.attrs.get("btc_exit_level")
+        lvl = btc_exit
         if lvl:
             st.markdown("---")
             st.markdown(f"**Sell everything if Bitcoin closes below "
@@ -224,7 +238,7 @@ with tab_live:
             st.dataframe(pd.DataFrame({
                 "share of your crypto money": (now_book * 100).round(0).astype(int).astype(str) + "%",
                 "price": [px(s) for s in now_book.index],
-                "sell below": [px(s, "exit_below") for s in now_book.index],
+                "sell below": [ex(s) for s in now_book.index],
             }), use_container_width=True)
             st.caption("Splitting evenly instead is simpler and close, but the "
                        "backtested numbers used this volatility-weighted split.")
