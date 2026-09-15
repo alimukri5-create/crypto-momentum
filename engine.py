@@ -122,6 +122,11 @@ def compute_signals(close: pd.DataFrame, quote_vol: pd.DataFrame, cfg: Config = 
         "adv_musd": adv_musd,
         "horizon_rets": horizon_rets,
         "daily_ret": daily_ret,
+        # The moving average IS the exit level: the time-series gate drops a
+        # name the moment it closes below this, so it can be quoted as a real
+        # "sell if it closes under X" price rather than an invented target.
+        # It moves a little each day, so it is re-read on each rebalance.
+        "exit_level": ma,
     }
 
 
@@ -280,17 +285,24 @@ def current_ranking(close: pd.DataFrame, quote_vol: pd.DataFrame, cfg: Config = 
         "ts_gate": sig["ts_gate"].iloc[i],
         "vol_gate": sig["vol_gate"].iloc[i],
         "liq_gate": sig["liq_gate"].iloc[i],
+        "price": close.iloc[i],
+        "exit_below": sig["exit_level"].iloc[i],
     })
+    tbl["room_to_exit_%"] = (tbl["price"] / tbl["exit_below"] - 1.0) * 100
     tbl["eligible"] = tbl["liq_gate"] & (tbl["vol_gate"] if cfg.use_volume_filter else True)
     if cfg.use_ts_gate and not cfg.cross_sectional_only:
         tbl["eligible"] &= tbl["ts_gate"]
     tbl = tbl.sort_values("score", ascending=False)
 
-    btc_on = None
+    btc_on, btc_level, btc_price = None, None, None
     if cfg.use_btc_regime and BENCHMARK in close.columns:
         b = close[BENCHMARK]
-        btc_on = bool(b.iloc[-1] > b.rolling(cfg.btc_regime_ma).mean().iloc[-1])
+        btc_level = float(b.rolling(cfg.btc_regime_ma).mean().iloc[-1])
+        btc_price = float(b.iloc[-1])
+        btc_on = bool(btc_price > btc_level)
     tbl.attrs["btc_risk_on"] = btc_on
+    tbl.attrs["btc_exit_level"] = btc_level
+    tbl.attrs["btc_price"] = btc_price
     tbl.attrs["as_of"] = str(close.index[-1].date())
     return tbl
 

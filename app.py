@@ -131,8 +131,6 @@ with tab_live:
     risk_on = tbl.attrs["btc_risk_on"]
     today = pd.Timestamp.utcnow().tz_localize(None).normalize()
 
-    # What the rule picked at the last rebalance, and the one before it.
-    # Derived from history, so nothing has to be remembered or entered.
     w_all = res["weights"]
     rebal_rows = [i for i, d in enumerate(w_all.index)
                   if d.dayofweek in cfg.rebalance_days]
@@ -143,7 +141,6 @@ with tab_live:
 
     now_book = book_at(rebal_rows[-1]) if rebal_rows else pd.Series(dtype=float)
     prev_book = book_at(rebal_rows[-2]) if len(rebal_rows) > 1 else pd.Series(dtype=float)
-    last_rebal_date = w_all.index[rebal_rows[-1]] if rebal_rows else None
 
     added = [s for s in now_book.index if s not in prev_book.index]
     dropped = [s for s in prev_book.index if s not in now_book.index]
@@ -152,63 +149,85 @@ with tab_live:
     def nm(s):
         return s.replace("USDT", "").replace("USD", "")
 
-    # ---------------------------------------------------------------- state
-    if cfg.use_btc_regime and risk_on is False:
-        st.error("### 🔴 RISK OFF — sell everything, sit in cash\n"
-                 "Bitcoin is below its trend. The rule says hold nothing "
-                 "until it flips back.")
-    else:
-        # ------------------------------------------------------------ HOLD
-        st.markdown("## Hold these")
-        if len(now_book) == 0:
-            st.warning("Nothing qualifies right now. The rule says hold cash.")
-        else:
-            cols = st.columns(len(now_book))
-            for c, (sym, wt) in zip(cols, now_book.items()):
-                flag = "🟢 NEW" if sym in added else ""
-                c.metric(nm(sym), f"{wt:.0%}", flag or None)
-            invested = float(now_book.sum())
-            if invested < 0.99:
-                st.caption(f"Remaining {1 - invested:.0%} stays in cash — "
-                           "fewer names qualified than the rule wants to hold.")
+    def px(s, col="price"):
+        try:
+            v = float(tbl.loc[s, col])
+            if v >= 1000:  return f"{v:,.0f}"
+            if v >= 1:     return f"{v:,.2f}"
+            return f"{v:,.4f}"
+        except Exception:
+            return "?"
 
-        # ----------------------------------------------------------- CHANGES
-        st.markdown("## What changed")
-        if not added and not dropped:
-            st.success("**Nothing changed.** Same names as last rebalance. "
-                       "No trades.")
-        else:
-            if dropped:
-                st.markdown("**🔴 SELL** — " + ", ".join(f"**{nm(s)}**" for s in dropped))
-            if added:
-                st.markdown("**🟢 BUY** — " + ", ".join(f"**{nm(s)}**" for s in added))
-            if kept:
-                st.markdown("⚪ Keep holding — " + ", ".join(nm(s) for s in kept))
-            st.caption("Sell first, then buy with the proceeds. Split your "
-                       "crypto money across the names above in the percentages "
-                       "shown. Market orders on spot.")
+    is_rebal_today = today.dayofweek in cfg.rebalance_days
+    day_label = today.strftime("%A %d %b")
+
+    # ---------------------------------------------------------------- RISK OFF
+    if cfg.use_btc_regime and risk_on is False:
+        lvl = tbl.attrs.get("btc_exit_level")
+        st.markdown(f"# 🔴 Sell everything")
+        st.markdown("Bitcoin is below its trend line. Close every position "
+                    "at market and stay in cash.")
+        if lvl:
+            st.caption(f"Back in when BTC closes above \\${lvl:,.0f}.")
+
+    else:
+        # ------------------------------------------------------------- SELL
+        if dropped:
+            st.markdown("# Sell")
+            for s in dropped:
+                st.markdown(f"### {nm(s)} &nbsp; — &nbsp; sell now at market "
+                            f"(~\\${px(s)})")
+
+        # -------------------------------------------------------------- BUY
+        if added:
+            st.markdown("# Buy")
+            for s in added:
+                st.markdown(
+                    f"### {nm(s)} &nbsp; — &nbsp; buy at ~\\${px(s)}\n"
+                    f"Sell it if it closes below **\\${px(s, 'exit_below')}**")
+
+        # ------------------------------------------------------------- HOLD
+        if kept:
+            st.markdown("# Hold")
+            for s in kept:
+                st.markdown(
+                    f"**{nm(s)}** — sell if it closes below "
+                    f"**\\${px(s, 'exit_below')}**  ·  now \\${px(s)}")
+
+        if not dropped and not added and not kept:
+            st.markdown("# Nothing to hold")
+            st.markdown("No coin passes the rules right now. Stay in cash.")
+        elif not dropped and not added:
+            st.markdown("### ✅ No trades — nothing changed since last time.")
+
+        lvl = tbl.attrs.get("btc_exit_level")
+        if lvl:
+            st.markdown("---")
+            st.markdown(f"**Sell everything if Bitcoin closes below "
+                        f"\\${lvl:,.0f}.**")
 
     # ------------------------------------------------------------- timing
-    is_rebal_today = today.dayofweek in cfg.rebalance_days
+    st.markdown("---")
     if is_rebal_today:
-        st.info("**Today is a rebalance day.** Act on the above.")
+        st.markdown(f"*{day_label} — trading day. Act on the above.*")
     else:
         nxt = min(((d - today.dayofweek) % 7) or 7 for d in cfg.rebalance_days)
-        nxt_date = (today + pd.Timedelta(days=nxt)).strftime("%A %d %b")
-        st.info(f"**Not a rebalance day — do nothing.** Next check: {nxt_date}. "
-                f"The list above is from the last rebalance"
-                + (f" ({last_rebal_date.strftime('%a %d %b')})" if last_rebal_date is not None else "")
-                + " and may change by then.")
+        st.markdown(f"*{day_label} — not a trading day, nothing to do. "
+                    f"Next check: {(today + pd.Timedelta(days=nxt)).strftime('%A %d %b')}.*")
 
-    with st.expander("Why these names"):
-        detail = tbl.loc[[s for s in now_book.index if s in tbl.index]] \
-            if len(now_book) else tbl.head(0)
-        if len(detail):
-            st.dataframe(detail[["score", "ret_14d_%", "ret_30d_%",
-                                 "ret_60d_%", "ann_vol_%", "adv_$M"]].round(2),
-                         use_container_width=True)
-        st.caption("Score blends 14/30/60-day return divided by volatility. "
-                   "Weights are inverse to volatility, so calmer names get more.")
+    st.caption("Exit levels move a little each day — re-read them each time "
+               "you open this. Prices are yesterday's close; buy at whatever "
+               "the market shows when you place the order.")
+
+    with st.expander("How much of each (the split the backtest used)"):
+        if len(now_book):
+            st.dataframe(pd.DataFrame({
+                "share of your crypto money": (now_book * 100).round(0).astype(int).astype(str) + "%",
+                "price": [px(s) for s in now_book.index],
+                "sell below": [px(s, "exit_below") for s in now_book.index],
+            }), use_container_width=True)
+            st.caption("Splitting evenly instead is simpler and close, but the "
+                       "backtested numbers used this volatility-weighted split.")
 
     st.subheader("Full ranking")
     st.dataframe(
