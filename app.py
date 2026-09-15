@@ -245,24 +245,26 @@ with tab_live:
             buys = orders[orders["action"] == "BUY"]
             holds = orders[orders["action"] == "HOLD"]
 
+            # NOTE: escape every "$" as "\$" — Streamlit's markdown treats a
+            # pair of dollar signs as LaTeX math and mangles the amounts.
+            def line(action, r):
+                u = f"{r['approx_units']:g}" if r["approx_units"] else "?"
+                return (f"- **{action} {r['symbol'].replace('USDT', '')}** — "
+                        f"about **{u} units**  ·  \\${r['usd']:,.0f}  "
+                        f"·  at ~\\${r['price']:,.4g}")
+
             if len(sells):
-                st.markdown("#### 🔴 SELL first")
+                st.markdown("#### 🔴 SELL")
                 for _, r in sells.iterrows():
-                    u = f"{r['approx_units']:g}" if r["approx_units"] else "?"
-                    st.markdown(
-                        f"- **{r['action']} {r['symbol'].replace('USDT','')}** — "
-                        f"about **{u} units** (${r['usd']:,.0f}) at ~${r['price']:,.4g}")
+                    st.markdown(line(r["action"], r))
             if len(buys):
-                st.markdown("#### 🟢 THEN BUY")
+                st.markdown("#### 🟢 " + ("THEN BUY" if len(sells) else "BUY"))
                 for _, r in buys.iterrows():
-                    u = f"{r['approx_units']:g}" if r["approx_units"] else "?"
-                    st.markdown(
-                        f"- **BUY {r['symbol'].replace('USDT','')}** — "
-                        f"about **{u} units** (${r['usd']:,.0f}) at ~${r['price']:,.4g}")
+                    st.markdown(line("BUY", r))
             if len(holds):
                 st.markdown("#### ⚪ LEAVE ALONE")
                 st.markdown(", ".join(
-                    f"**{r['symbol'].replace('USDT','')}** (${r['target_usd']:,.0f})"
+                    f"**{r['symbol'].replace('USDT', '')}** (\\${r['target_usd']:,.0f})"
                     for _, r in holds.iterrows()))
 
             st.caption(
