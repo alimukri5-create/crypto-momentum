@@ -98,7 +98,7 @@ st.caption("Long-only spot · time-series gate + cross-sectional selection · "
 
 try:
     with st.spinner("Fetching market data…"):
-        close, qvol, report = load(tuple(universe), start)
+        close, qvol, report, _tbq = load(tuple(universe), start)
 except Exception as e:
     st.error(f"Could not load market data: {e}")
     st.stop()

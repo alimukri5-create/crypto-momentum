@@ -42,7 +42,13 @@ UNIVERSE = [
 
 BENCHMARK = "BTCUSDT"
 
-COLUMNS = ["open", "high", "low", "close", "volume", "quote_volume"]
+COLUMNS = ["open", "high", "low", "close", "volume", "quote_volume",
+           "taker_buy_quote", "trades"]
+
+# taker_buy_quote is the share of each bar's quote volume that lifted the ask
+# rather than hit the bid. It IS order-flow imbalance, it is free, and it
+# backfills — which is unusual for a flow signal. Only Binance reports it;
+# Coinbase does not, so flow work requires the Binance venue.
 
 
 # --------------------------------------------------------------------------
@@ -82,13 +88,14 @@ class Binance(Venue):
                 continue
         return False
 
-    def fetch(self, symbol: str, start: pd.Timestamp) -> pd.DataFrame:
+    def fetch(self, symbol: str, start: pd.Timestamp,
+              interval: str = "1d") -> pd.DataFrame:
         rows, cursor = [], int(start.timestamp() * 1000)
         while True:
             try:
                 r = self.s.get(
                     f"{self.host}/api/v3/klines",
-                    params={"symbol": symbol, "interval": "1d",
+                    params={"symbol": symbol, "interval": interval,
                             "limit": 1000, "startTime": cursor},
                     timeout=25)
             except Exception:
@@ -111,8 +118,10 @@ class Binance(Venue):
 
         df = pd.DataFrame(rows, columns=[
             "open_time", "open", "high", "low", "close", "volume",
-            "close_time", "quote_volume", "trades", "tb", "tq", "ig"])
-        df["date"] = pd.to_datetime(df["open_time"], unit="ms").dt.normalize()
+            "close_time", "quote_volume", "trades", "tb_base",
+            "taker_buy_quote", "ig"])
+        ts = pd.to_datetime(df["open_time"], unit="ms")
+        df["date"] = ts.dt.normalize() if interval == "1d" else ts
         for c in COLUMNS:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         return df.set_index("date")[COLUMNS].sort_index()
@@ -147,7 +156,10 @@ class Coinbase(Venue):
         except Exception:
             return False
 
-    def fetch(self, symbol: str, start: pd.Timestamp) -> pd.DataFrame:
+    def fetch(self, symbol: str, start: pd.Timestamp,
+              interval: str = "1d") -> pd.DataFrame:
+        if interval != "1d":
+            return pd.DataFrame(columns=COLUMNS)   # daily only on this venue
         product = self.MAP.get(symbol)
         if product is None:
             return pd.DataFrame(columns=COLUMNS)
@@ -183,6 +195,9 @@ class Coinbase(Venue):
         # Coinbase volume is in BASE units — approximate quote volume.
         typical = (df["high"] + df["low"] + df["close"]) / 3.0
         df["quote_volume"] = df["volume"] * typical
+        # No taker-buy breakdown on this venue — flow signals need Binance.
+        df["taker_buy_quote"] = np.nan
+        df["trades"] = np.nan
         for c in COLUMNS:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         return df[COLUMNS]
@@ -205,7 +220,8 @@ def pick_venue(session: requests.Session | None = None) -> Venue:
 # Loading
 # --------------------------------------------------------------------------
 
-def load_universe(symbols=None, start="2021-01-01", progress=None):
+def load_universe(symbols=None, start="2021-01-01", progress=None,
+                  interval="1d"):
     """
     Returns (panel_close, panel_quote_volume, report).
     `progress` is an optional callable(i, n, symbol, ok) for UI feedback.
@@ -218,7 +234,7 @@ def load_universe(symbols=None, start="2021-01-01", progress=None):
     data, missing, short = {}, [], []
     for i, sym in enumerate(symbols, 1):
         try:
-            df = venue.fetch(sym, start_ts)
+            df = venue.fetch(sym, start_ts, interval)
         except Exception:
             df = pd.DataFrame(columns=COLUMNS)
         ok = (not df.empty) and len(df) >= 120
@@ -236,6 +252,7 @@ def load_universe(symbols=None, start="2021-01-01", progress=None):
 
     close = pd.DataFrame({s: d["close"] for s, d in data.items()}).sort_index()
     qvol = pd.DataFrame({s: d["quote_volume"] for s, d in data.items()}).sort_index()
+    tbq = pd.DataFrame({s: d["taker_buy_quote"] for s, d in data.items()}).sort_index()
 
     report = {
         "venue": venue.name,
@@ -251,4 +268,6 @@ def load_universe(symbols=None, start="2021-01-01", progress=None):
             s for s in data
             if data[s].index[0] > start_ts + pd.Timedelta(days=30)),
     }
-    return close, qvol, report
+    report["has_flow"] = bool(tbq.notna().any().any())
+    report["interval"] = interval
+    return close, qvol, report, tbq
