@@ -93,29 +93,77 @@ cfg = eng.Config(
 # the OLD shape to NEW code and the app dies on unpack.
 CACHE_VERSION = 2
 
+# The Today tab only needs enough history to rank names and compute exit
+# levels: 60-day momentum horizons and a 50-day moving average, plus warmup.
+# Fetching five years for that made every cold start take ~2 minutes, and
+# Streamlit's free tier sleeps the app after ~12h — so the slow path was hit
+# on essentially every visit.
+#
+# Verified on synthetic data: the current book is IDENTICAL for any window
+# from 6 months upward, so the hold-buffer's path dependence washes out well
+# before this. 12 months is chosen for margin.
+FAST_MONTHS = 12
+
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def load(symbols, start, cache_version=CACHE_VERSION):
     return dat.load_universe(symbols, start)
 
+
+def _unpack(loaded):
+    """Positional, extra-tolerant: a shape change can never white-screen."""
+    return loaded[0], loaded[1], loaded[2]
+
+
 st.title("Crypto Momentum")
 st.caption("Long-only spot · time-series gate + cross-sectional selection · "
            "volatility-scaled sizing")
 
+fast_start = (pd.Timestamp.utcnow().tz_localize(None)
+              - pd.DateOffset(months=FAST_MONTHS)).strftime("%Y-%m-%d")
+
 try:
-    with st.spinner("Fetching market data…"):
-        _loaded = load(tuple(universe), start)
-        # Tolerant unpack: a stale cache entry with the old shape degrades
-        # gracefully instead of taking the whole page down.
-        close, qvol, report = _loaded[0], _loaded[1], _loaded[2]
+    with st.spinner("Fetching recent market data…"):
+        close, qvol, report = _unpack(load(tuple(universe), fast_start))
 except Exception as e:
     st.error(f"Could not load market data: {e}")
     st.stop()
 
+
+# Full history is loaded ONLY when a backtest tab asks for it. Streamlit runs
+# every tab body on every rerun, so laziness has to be explicit rather than
+# relying on which tab is open.
+_full = {}
+
+
+def get_full():
+    """(close, qvol, report, results) over the full backtest window."""
+    key = (tuple(universe), start)
+    if key not in _full:
+        with st.spinner(f"Fetching full history from {start}… "
+                        "(one-off, then cached for an hour)"):
+            c, q, r = _unpack(load(tuple(universe), start))
+        with st.spinner("Running backtest…"):
+            _full[key] = (c, q, r, eng.run_all(c, q, cfg))
+    return _full[key]
+
+
+def full_gate(label: str) -> bool:
+    """Show a load button unless full history has already been requested."""
+    if st.session_state.get("want_full"):
+        return True
+    st.info(f"**{label}** needs the full history from {start}, which takes "
+            "a minute to fetch. The Today tab does not, which is why this "
+            "page now loads fast.")
+    if st.button("Load full history", key=f"load_{label}"):
+        st.session_state["want_full"] = True
+        st.rerun()
+    return False
+
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Venue", report["venue"])
 c2.metric("Symbols", len(report["loaded"]))
-c3.metric("Days", report["n_days"])
+c3.metric("Days", report["n_days"], f"last {FAST_MONTHS}mo")
 c4.metric("Through", report["end"])
 
 if report["missing"] or report["too_short"]:
@@ -125,8 +173,8 @@ if report["missing"] or report["too_short"]:
         if report["too_short"]:
             st.write("**Too little history:**", ", ".join(report["too_short"]))
 
+# Today tab runs on the fast window — same book, a fraction of the fetch.
 res = eng.run_all(close, qvol, cfg)
-bt, w = res["backtest"], res["weights"]
 
 # --------------------------------------------------------------------------
 # Live ranking — the tab you use on a rebalance day
@@ -263,12 +311,16 @@ with tab_live:
 # --------------------------------------------------------------------------
 
 with tab_perf:
-    stats_tbl = res["stats"].round(2)
+  if full_gate("Performance"):
+    _c, _q, _r, res_full = get_full()
+    bt = res_full["backtest"]
+    st.caption(f"Backtest over {_r['start']} to {_r['end']} "
+               f"({_r['n_days']} days, {len(_r['loaded'])} symbols).")
+    stats_tbl = res_full["stats"].round(2)
     st.dataframe(stats_tbl, use_container_width=True)
 
-    strat = bt["equity"]
-    curves = pd.DataFrame({"Momentum (net)": strat})
-    for name, r in eng.benchmarks(close).items():
+    curves = pd.DataFrame({"Momentum (net)": bt["equity"]})
+    for name, r in eng.benchmarks(_c).items():
         curves[name] = (1 + r).cumprod()
     st.subheader("Equity curves (log)")
     st.line_chart(np.log10(curves.clip(lower=1e-9)), use_container_width=True)
@@ -296,10 +348,14 @@ with tab_perf:
 # --------------------------------------------------------------------------
 
 with tab_risk:
+  if full_gate("Risk"):
+    _c, _q, _r, res_full = get_full()
+    bt = res_full["backtest"]
+    report_full = _r
     st.subheader("Survivorship bias")
-    late = report["late_listings"]
+    late = report_full["late_listings"]
     st.write(
-        f"The universe is **{len(report['loaded'])} names liquid today**. "
+        f"The universe is **{len(report_full['loaded'])} names liquid today**. "
         f"Coins that were liquid in the past and have since died are absent, "
         f"which flatters every number on the Performance tab.")
     if late:
@@ -338,6 +394,9 @@ with tab_risk:
 # --------------------------------------------------------------------------
 
 with tab_detail:
+  if full_gate("Detail"):
+    _c, _q, _r, res_full = get_full()
+    w = res_full["weights"]
     st.subheader("Holdings over time")
     held = (w > 0).astype(int)
     st.caption("Number of days each name was held")
