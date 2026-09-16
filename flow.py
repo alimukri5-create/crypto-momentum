@@ -145,6 +145,12 @@ def ic_by_horizon(signal: pd.DataFrame, close: pd.DataFrame,
     Returns one row per horizon: mean IC, standard error, t-statistic, and the
     share of bars where IC was positive.
     """
+    # pandas delegates method="spearman"/"kendall" to scipy, which is not a
+    # dependency here (and pulling scipy in just for a rank correlation is a
+    # heavy install on a free tier). Spearman IS Pearson on ranks, so rank the
+    # two columns and use the built-in Pearson — same number, no scipy.
+    spearman = method == "spearman"
+
     out = []
     for h in horizons:
         fwd = close.shift(-h) / close - 1.0
@@ -156,7 +162,12 @@ def ic_by_horizon(signal: pd.DataFrame, close: pd.DataFrame,
             f = fwd.iloc[i]
             both = pd.concat([s, f], axis=1).dropna()
             if len(both) >= 8:
-                c = both.iloc[:, 0].corr(both.iloc[:, 1], method=method)
+                a, b = both.iloc[:, 0], both.iloc[:, 1]
+                if spearman:
+                    a, b = a.rank(), b.rank()
+                    c = a.corr(b)                 # Pearson on ranks
+                else:
+                    c = a.corr(b, method=method)
                 if c == c:
                     ics.append(c)
         if not ics:
