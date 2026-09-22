@@ -325,6 +325,110 @@ with tab_perf:
     st.subheader("Equity curves (log)")
     st.line_chart(np.log10(curves.clip(lower=1e-9)), use_container_width=True)
 
+    # ---------------------------------------------------------------------
+    # THE PERIOD-SPLIT TEST
+    # Every other number on this page is measured on ONE window. A strategy
+    # that earned everything in a single bull run looks identical, on that one
+    # window, to one that works. Cutting the window up is the only way to tell
+    # them apart without waiting for new data.
+    # ---------------------------------------------------------------------
+    st.subheader("Does it work in more than one period?")
+    st.caption(
+        "Everything above is measured on one stretch of history. If the whole "
+        "result came from a single good year, it would look exactly the same. "
+        "So: cut the history into pieces and check each piece on its own. The "
+        "comparison is against owning all the coins equally — that control has "
+        "the same survivorship problem as the strategy, so the bias largely "
+        "cancels in the gap between them."
+    )
+
+    n_sp = st.radio("Cut the history into", [2, 3, 4], index=0,
+                    horizontal=True, format_func=lambda k: f"{k} periods",
+                    key="n_splits")
+
+    sp = eng.split_report(bt, _c, n_splits=int(n_sp))
+    v = sp["verdict"]
+    (st.success if v == "HOLDS IN EVERY PERIOD" else
+     st.warning if v == "HOLDS, BUT CONCENTRATED" else
+     st.error)(f"**{v}** — {sp['why']}")
+
+    if not sp["periods"].empty:
+        show = sp["periods"].rename(columns={
+            "period": "Period", "from": "From", "to": "To", "days": "Days",
+            "strategy_CAGR_%": "Strategy %/yr",
+            "equal_weight_CAGR_%": "Own everything %/yr",
+            "BTC_CAGR_%": "Just hold BTC %/yr",
+            "edge_pp": "Gap (pp/yr)",
+            "strategy_Sharpe": "Sharpe", "strategy_maxDD_%": "Worst fall %",
+        })
+        st.dataframe(show.round(1), use_container_width=True, hide_index=True)
+        st.caption("**Gap** is the only column that matters: strategy minus "
+                   "owning everything equally. It has to be comfortably "
+                   "positive in every row, not just on average.")
+
+    if not sp["yearly"].empty:
+        yr = sp["yearly"].set_index("year")
+        st.bar_chart(yr[["edge_pp"]].rename(
+            columns={"edge_pp": "Gap vs owning everything (pp)"}),
+            use_container_width=True)
+        st.caption("Year by year. Bars below zero are years the picking lost "
+                   "to simply owning the whole list.")
+
+    with st.expander("What this test cannot tell you"):
+        st.markdown(
+            "- **It is not out-of-sample.** The settings were chosen while "
+            "looking at the whole history, so hindsight is baked into every "
+            "period. Passing rules out the crudest failure — *it all came "
+            "from one year* — and nothing more.\n"
+            "- **Dead coins are still invisible.** Every name here survived "
+            "to today. Coins that went to zero are in no period.\n"
+            "- **The only clean test is forward.** Paper-trading it from here "
+            "produces evidence that none of this can fake."
+        )
+
+    st.divider()
+
+    # ---------------------------------------------------------------------
+    # THE ALT-SELECTION TEST
+    # In a bull market every dollar chart looks good. Dividing by Bitcoin is
+    # what shows whether picking names beat simply holding BTC.
+    # ---------------------------------------------------------------------
+    st.subheader("Denominated in Bitcoin")
+    st.caption(
+        "Dollar returns flatter everything when the market rises. The real "
+        "question for a long-only book is whether selecting five names beat "
+        "just holding BTC — which is only visible once you divide by BTC."
+    )
+
+    rep = eng.btc_denominated_report(bt, _c)
+    if not rep:
+        st.info("BTC not in the universe, so this comparison is unavailable.")
+    else:
+        v = rep["verdict"]
+        (st.error if v == "HOLD BTC" else
+         st.warning if v == "ALT BETA, NOT SELECTION" else
+         st.success)(f"**{v}** — {rep['why']}")
+
+        b1, b2 = st.columns(2)
+        b1.metric("Strategy, in BTC terms", f"{rep['strategy_final']:.2f}x",
+                  f"{(rep['strategy_final'] - 1) * 100:+.0f}% vs holding BTC")
+        b2.metric("Equal-weight universe, in BTC terms",
+                  f"{rep['equal_weight_final']:.2f}x",
+                  f"{(rep['equal_weight_final'] - 1) * 100:+.0f}% vs holding BTC")
+
+        st.dataframe(pd.DataFrame([rep["strategy_vs_btc"],
+                                   rep["equal_weight_vs_btc"]])
+                     .set_index("name").round(2), use_container_width=True)
+
+        st.line_chart(pd.DataFrame({
+            "Strategy / BTC": rep["strategy_equity_btc"],
+            "Equal-weight / BTC": rep["equal_weight_equity_btc"],
+        }), use_container_width=True)
+        st.caption("Above 1.0 means it beat holding Bitcoin. Below means it "
+                   "did not, however good the dollar chart looks.")
+
+    st.divider()
+
     beat_btc = (stats_tbl.loc["momentum (net)", "CAGR_%"]
                 > stats_tbl.loc["buy_hold_BTC", "CAGR_%"]) \
         if "buy_hold_BTC" in stats_tbl.index else None

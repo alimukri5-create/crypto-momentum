@@ -322,6 +322,77 @@ def benchmarks(close: pd.DataFrame) -> dict:
     return out
 
 
+def denominate(strategy_ret: pd.Series, bench_ret: pd.Series) -> pd.Series:
+    """
+    Express a return series in units of the benchmark asset rather than USD.
+
+    THE POINT: in a bull market every dollar chart looks good. The question
+    that decides whether security selection earned its keep is "did this beat
+    simply holding Bitcoin?" — and that is only visible once you divide by
+    Bitcoin. A strategy whose BTC-denominated equity ends below 1.0 destroyed
+    value versus doing nothing, however good the dollar chart looked.
+
+        r_rel = (1 + r_strategy) / (1 + r_benchmark) - 1
+    """
+    a, b = strategy_ret.align(bench_ret, join="inner")
+    return (1 + a) / (1 + b) - 1
+
+
+def btc_denominated_report(bt: pd.DataFrame, close: pd.DataFrame,
+                           benchmark: str = BENCHMARK) -> dict:
+    """
+    The alt-selection test. Returns BTC-denominated stats for the strategy and
+    for an equal-weight basket of the whole universe, plus a plain verdict.
+
+    Separating the two matters: if the equal-weight basket also beats BTC then
+    the gain is alt beta, not selection, and a simpler portfolio captures it.
+    """
+    if benchmark not in close.columns:
+        return {}
+
+    btc_ret = close[benchmark].pct_change().fillna(0.0)
+    ew_ret = close.pct_change().fillna(0.0).mean(axis=1)
+
+    strat_rel = denominate(bt["net_ret"], btc_ret)
+    ew_rel = denominate(ew_ret, btc_ret)
+
+    strat_eq = (1 + strat_rel).cumprod()
+    ew_eq = (1 + ew_rel).cumprod()
+
+    out = {
+        "strategy_vs_btc": stats(strat_rel, "strategy in BTC terms"),
+        "equal_weight_vs_btc": stats(ew_rel, "equal-weight universe in BTC terms"),
+        "strategy_final": float(strat_eq.iloc[-1]),
+        "equal_weight_final": float(ew_eq.iloc[-1]),
+        "strategy_equity_btc": strat_eq,
+        "equal_weight_equity_btc": ew_eq,
+    }
+
+    s, e = out["strategy_final"], out["equal_weight_final"]
+    if s < 1.0:
+        out["verdict"] = "HOLD BTC"
+        out["why"] = (
+            f"The strategy ended at {s:.2f}x in BTC terms — it LOST value "
+            "against simply holding Bitcoin. The dollar returns came from "
+            "Bitcoin going up, not from picking names. Selection destroyed "
+            "value and the honest strategy is to hold BTC and use the regime "
+            "gate to decide when to be in.")
+    elif e >= s:
+        out["verdict"] = "ALT BETA, NOT SELECTION"
+        out["why"] = (
+            f"The strategy ended at {s:.2f}x in BTC terms but an equal-weight "
+            f"basket of the SAME universe ended at {e:.2f}x. Holding all the "
+            "alts beat picking five of them, so the gain is alt beta. The "
+            "ranking is not adding value.")
+    else:
+        out["verdict"] = "SELECTION ADDS VALUE"
+        out["why"] = (
+            f"The strategy ended at {s:.2f}x in BTC terms, ahead of the "
+            f"equal-weight basket at {e:.2f}x. Selection beat both Bitcoin "
+            "and owning the whole universe — that is the result worth having.")
+    return out
+
+
 def run_all(close: pd.DataFrame, qvol: pd.DataFrame, cfg: Config):
     """One call: signals -> weights -> backtest -> stats table."""
     sig = compute_signals(close, qvol, cfg)
@@ -335,3 +406,129 @@ def run_all(close: pd.DataFrame, qvol: pd.DataFrame, cfg: Config):
     table = pd.DataFrame(rows).set_index("name")
 
     return {"signals": sig, "weights": w, "backtest": bt, "stats": table}
+
+
+# ============================================================================
+# PERIOD SPLIT — does the edge exist in more than one stretch of history?
+# ============================================================================
+#
+# Every number on the Performance tab is measured on ONE window: 2021 to now.
+# A strategy that earned everything in a single bull run and nothing since is
+# indistinguishable, on that one window, from a strategy that works. The only
+# way to tell them apart without new data is to cut the window into pieces and
+# ask whether the edge shows up in each piece independently.
+#
+# The edge is measured against equal_weight_universe, not against BTC. Both the
+# strategy and the equal-weight basket are drawn from the same 37 survivors, so
+# survivorship bias inflates both of them and largely cancels in the difference.
+# The BTC comparison does not cancel, so it is reported but not used to judge.
+#
+# This is NOT out-of-sample testing. Nothing was fitted on one half and tested
+# on the other; the parameters were chosen while looking at the whole window.
+# A split that passes only rules out the crudest failure — "it all came from
+# one year". It cannot rule out choices made with hindsight over the whole span.
+
+def _edge_vs_control(r_strat: pd.Series, r_ctrl: pd.Series) -> float:
+    """CAGR of the strategy minus CAGR of the control, in percentage points."""
+    a = stats(r_strat, "s")
+    b = stats(r_ctrl, "c")
+    if not a or not b:
+        return float("nan")
+    return a["CAGR_%"] - b["CAGR_%"]
+
+
+def split_report(bt: pd.DataFrame, close: pd.DataFrame, n_splits: int = 2) -> dict:
+    """
+    Cut the backtest into n contiguous equal-length periods and report the
+    strategy, the equal-weight control and BTC in each one separately.
+
+    Returns {"periods": DataFrame, "yearly": DataFrame, "verdict": str,
+             "why": str, "edges": [pp, ...]}
+    """
+    bm = benchmarks(close)
+    ctrl = bm.get("equal_weight_universe")
+    btc = bm.get("buy_hold_BTC")
+
+    r = bt["net_ret"].dropna()
+    if ctrl is not None:
+        r, ctrl = r.align(ctrl, join="inner")
+    if btc is not None:
+        btc = btc.reindex(r.index)
+
+    n = len(r)
+    if n < 2 * n_splits or ctrl is None:
+        return {"periods": pd.DataFrame(), "yearly": pd.DataFrame(),
+                "verdict": "NOT ENOUGH DATA",
+                "why": "Too few days to split meaningfully.", "edges": []}
+
+    bounds = [(i * n // n_splits, (i + 1) * n // n_splits) for i in range(n_splits)]
+
+    rows, edges = [], []
+    for k, (lo, hi) in enumerate(bounds, start=1):
+        rs, rc = r.iloc[lo:hi], ctrl.iloc[lo:hi]
+        st, sc = stats(rs, "strategy"), stats(rc, "equal_weight")
+        if not st or not sc:
+            continue
+        edge = st["CAGR_%"] - sc["CAGR_%"]
+        edges.append(edge)
+        row = {
+            "period": f"{k} of {n_splits}",
+            "from": rs.index[0].date(), "to": rs.index[-1].date(),
+            "days": len(rs),
+            "strategy_CAGR_%": st["CAGR_%"],
+            "equal_weight_CAGR_%": sc["CAGR_%"],
+            "edge_pp": edge,
+            "strategy_Sharpe": st["Sharpe"],
+            "strategy_maxDD_%": st["max_DD_%"],
+        }
+        if btc is not None:
+            sb = stats(btc.iloc[lo:hi], "btc")
+            row["BTC_CAGR_%"] = sb.get("CAGR_%", float("nan"))
+        rows.append(row)
+
+    periods = pd.DataFrame(rows)
+
+    # Per-calendar-year, as a finer-grained view than halves.
+    yrows = []
+    for y, idx in r.groupby(r.index.year).groups.items():
+        rs, rc = r.loc[idx], ctrl.loc[idx]
+        st, sc = stats(rs, "s"), stats(rc, "c")
+        if not st or not sc:
+            continue
+        yr = {"year": int(y), "days": len(rs),
+              "strategy_return_%": st["total_return_%"],
+              "equal_weight_return_%": sc["total_return_%"],
+              "edge_pp": st["total_return_%"] - sc["total_return_%"]}
+        if btc is not None:
+            sb = stats(btc.loc[idx], "b")
+            yr["BTC_return_%"] = sb.get("total_return_%", float("nan"))
+        yrows.append(yr)
+    yearly = pd.DataFrame(yrows)
+
+    # Verdict. Deliberately harsh: the interesting failure is an edge that
+    # lives in one period, and an average would hide exactly that.
+    if not edges:
+        verdict, why = "NOT ENOUGH DATA", "Could not compute period stats."
+    elif min(edges) <= 0:
+        bad = [i + 1 for i, e in enumerate(edges) if e <= 0]
+        verdict = "ONE-PERIOD EFFECT"
+        why = (f"The strategy failed to beat an equal-weight basket in period(s) "
+               f"{', '.join(map(str, bad))} of {n_splits}. The headline number is "
+               f"carried by the other period(s), so it describes one stretch of "
+               f"history rather than a repeatable edge.")
+    elif min(edges) < 0.25 * max(edges):
+        verdict = "HOLDS, BUT CONCENTRATED"
+        why = (f"The edge is positive in every period, but lopsided: "
+               f"{max(edges):.0f}pp in the best against {min(edges):.0f}pp in the "
+               f"weakest. Real, but most of it was earned in one stretch — size "
+               f"positions off the weak period, not the average.")
+    else:
+        verdict = "HOLDS IN EVERY PERIOD"
+        why = (f"The strategy beat an equal-weight basket in all {n_splits} "
+               f"periods, by between {min(edges):.0f}pp and {max(edges):.0f}pp of "
+               f"annual return. That is the strongest evidence available without "
+               f"new data — though the parameters were still chosen while looking "
+               f"at the whole window, so this is not a true out-of-sample test.")
+
+    return {"periods": periods, "yearly": yearly,
+            "verdict": verdict, "why": why, "edges": edges}
